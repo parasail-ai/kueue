@@ -588,6 +588,19 @@ func (s *TASFlavorSnapshot) FindTopologyAssignmentsForFlavor(flavorTASRequests F
 	for _, groupKey := range groupsOrder {
 		trs := groupedTASRequests[groupKey]
 		if workload.HasUnhealthyNodes(opts.workload) {
+			if features.Enabled(features.TASSkipReplacementForPlacedPod) && ownedBySinglePod(opts.workload) {
+				// The pod cannot relocate and the Workload cannot outlive it; keep
+				// the existing assignment so admit clears UnhealthyNodes without
+				// diverging from the node the pod actually runs on.
+				for _, tr := range trs {
+					psa := findPSA(opts.workload, tr.PodSet.Name)
+					if psa == nil || psa.TopologyAssignment == nil {
+						continue
+					}
+					result[tr.PodSet.Name] = tasPodSetAssignmentResult{TopologyAssignment: utiltas.InternalFrom(psa.TopologyAssignment)}
+				}
+				continue
+			}
 			for _, tr := range trs {
 				// In case of looking for Node replacement, TopologyRequest has only
 				// PodSets with the Node to replace, so we match PodSetAssignment
@@ -1927,4 +1940,15 @@ func canMergeDomains(mergedDomains []utiltas.TopologyDomainAssignment, domain ut
 	}
 	lastDomain := mergedDomains[len(mergedDomains)-1]
 	return utiltas.DomainID(domain.Values) == utiltas.DomainID(lastDomain.Values)
+}
+
+// ownedBySinglePod reports whether the Workload is owned by exactly one Pod
+// (bare-Pod / Deployment-replica pod integration). Such a Workload cannot
+// outlive its pod, so no future pod can consume a replacement assignment.
+func ownedBySinglePod(wl *kueue.Workload) bool {
+	if wl == nil || len(wl.OwnerReferences) != 1 {
+		return false
+	}
+	ref := wl.OwnerReferences[0]
+	return ref.Kind == "Pod" && ref.APIVersion == "v1"
 }

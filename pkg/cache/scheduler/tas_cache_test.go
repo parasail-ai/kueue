@@ -25,6 +25,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/component-base/featuregate"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -7959,4 +7960,116 @@ func aggregatedDomainUsagesForPriorFlavorUsage(
 		aggregatedDomainUsages[domainID] = usage.Clone()
 	}
 	return aggregatedDomainUsages
+}
+
+func TestFindTopologyAssignmentsSkipReplacementForPlacedPod(t *testing.T) {
+	podSetName := kueue.PodSetReference("main")
+	levels := []string{corev1.LabelHostname}
+	nodes := []corev1.Node{
+		*testingnode.MakeNode("x1").
+			Label(corev1.LabelHostname, "x1").
+			StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourcePods: resource.MustParse("10")}).
+			NotReady().Obj(),
+		*testingnode.MakeNode("x2").
+			Label(corev1.LabelHostname, "x2").
+			StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourcePods: resource.MustParse("10")}).
+			Ready().Obj(),
+	}
+	existingTA := utiltestingapi.MakeTopologyAssignment(levels).
+		Domain(tas.TopologyDomainAssignment{Count: 1, Values: []string{"x1"}}).
+		Obj()
+	podGVK := corev1.SchemeGroupVersion.WithKind("Pod")
+	jobGVK := schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "Job"}
+
+	cases := map[string]struct {
+		gateEnabled bool
+		owners      []schema.GroupVersionKind
+		wantHost    string
+	}{
+		"gate on, single-Pod-owned: keeps the existing assignment": {
+			gateEnabled: true,
+			owners:      []schema.GroupVersionKind{podGVK},
+			wantHost:    "x1",
+		},
+		"gate on, Job-owned: replaced": {
+			gateEnabled: true,
+			owners:      []schema.GroupVersionKind{jobGVK},
+			wantHost:    "x2",
+		},
+		"gate on, two Pod owners (pod group): replaced": {
+			gateEnabled: true,
+			owners:      []schema.GroupVersionKind{podGVK, podGVK},
+			wantHost:    "x2",
+		},
+		"gate off, single-Pod-owned: replaced": {
+			gateEnabled: false,
+			owners:      []schema.GroupVersionKind{podGVK},
+			wantHost:    "x2",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.TASSkipReplacementForPlacedPod, tc.gateEnabled)
+			ctx, log := utiltesting.ContextWithLog(t)
+
+			wl := utiltestingapi.MakeWorkload("test-wl", "test-ns").
+				Admission(utiltestingapi.MakeAdmission("test-cq", podSetName).
+					PodSets(utiltestingapi.MakePodSetAssignment(podSetName).
+						Count(1).
+						TopologyAssignment(existingTA).
+						Obj()).
+					Obj()).
+				UnhealthyNodes("x1")
+			for i, gvk := range tc.owners {
+				wl = wl.OwnerReference(gvk, fmt.Sprintf("owner-%d", i), fmt.Sprintf("uid-%d", i))
+			}
+
+			flavorTASRequests := []TASPodSetRequests{{
+				PodSet: &kueue.PodSet{
+					Name:            podSetName,
+					TopologyRequest: &kueue.PodSetTopologyRequest{Required: ptr.To(corev1.LabelHostname)},
+					Template:        corev1.PodTemplateSpec{Spec: corev1.PodSpec{}},
+				},
+				SinglePodRequests: resources.Requests{corev1.ResourceCPU: 1000},
+				Count:             1,
+			}}
+
+			clientBuilder := utiltesting.NewClientBuilder()
+			for i := range nodes {
+				clientBuilder.WithObjects(&nodes[i])
+			}
+			_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
+			c := clientBuilder.Build()
+
+			tasCache := NewTASCache(c)
+			for i := range nodes {
+				tasCache.SyncNode(&nodes[i])
+			}
+			tasFlavorCache := tasCache.NewTASFlavorCache(
+				topologyInformation{Levels: levels},
+				flavorInformation{TopologyName: "default"},
+			)
+			snapshot := tasFlavorCache.snapshot(
+				log,
+				tasCache.nodesCache.find(tasFlavorCache.flavor.NodeLabels, tasFlavorCache.topology.Levels),
+				nil,
+			)
+			result := snapshot.FindTopologyAssignmentsForFlavor(flavorTASRequests, WithWorkload(wl.Obj()))
+
+			psResult, ok := result[podSetName]
+			if !ok {
+				t.Fatal("expected result for pod set 'main'")
+			}
+			if psResult.FailureReason != "" {
+				t.Fatalf("unexpected failure: %s", psResult.FailureReason)
+			}
+			want := &tas.TopologyAssignment{
+				Levels:  levels,
+				Domains: []tas.TopologyDomainAssignment{{Count: 1, Values: []string{tc.wantHost}}},
+			}
+			if diff := cmp.Diff(want, psResult.TopologyAssignment); diff != "" {
+				t.Errorf("unexpected topology assignment (-want,+got):\n%s", diff)
+			}
+		})
+	}
 }
